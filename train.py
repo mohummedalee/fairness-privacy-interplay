@@ -1,7 +1,7 @@
 import pdb
 import argparse
 import warnings; warnings.simplefilter(action='ignore', category=FutureWarning)
-import sys
+import os, sys
 sys.path.append("/work/fairness-privacy")  # root dir
 from typing import *
 
@@ -27,13 +27,10 @@ def tokenize(batch, tokenizer, maxlen):
 
 def evaluate_model(
         model: AutoModelForSequenceClassification,
-        val_dataloader: DataLoader,
-        train_dataloader: Optional[DataLoader] = None
-    ):
-    model.eval()
+        val_dataloader: DataLoader):    
     device = model.device
-    # TODO: make sure this device variable is accurate
-    val_loss = 0
+    model.eval()  # switch to evaluation mode
+    val_loss, val_acc = 0, 0
     for batch in val_dataloader:        
         # includes input_ids, attention_mask, labels etc.
         batch_topass = {
@@ -44,10 +41,20 @@ def evaluate_model(
         outputs = model(**batch_topass)
         loss = outputs.loss
         logits = outputs.logits
-        val_loss += loss.item()
+        batch_size = batch_topass['input_ids'].shape[0]
+        val_loss += loss.item() * batch_size
         # TODO: compare with GT predictions (batch_topass['labels'])
 
+        preds = torch.argmax(logits, axis=-1)
+        batch_acc = torch.sum(preds.cpu() == batch['label']).item()
+        val_acc += batch_acc
 
+    model.train()  # revert to training mode
+    val_loss /= len(val_dataloader.dataset)
+    val_acc /= len(val_dataloader.dataset)
+    return val_loss, val_acc
+
+# -> if use with Trainer required, something like this should be written
 # def compute_metrics(eval_preds, train_preds=None):
 #     logits, labels = eval_pred
 #     predictions = np.argmax(logits, axis=-1)
@@ -61,7 +68,7 @@ def train_custom_loop(
         val_data: datasets.Dataset
     ) -> AutoModelForSequenceClassification:
     """
-    Finetunes using a custom PyTorch training loop
+    Finetunes classification model using a custom PyTorch training loop.
 
     Parameters:
     model: base model to fine-tune
@@ -77,6 +84,7 @@ def train_custom_loop(
 
     num_epochs = args.epochs
     train_dataloader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
+    val_dataloader = DataLoader(val_data, batch_size=args.batch_size, shuffle=True)
     num_training_steps = num_epochs * len(train_dataloader)  # 152,607 for twitter-AAE-sentiment    
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -92,40 +100,61 @@ def train_custom_loop(
     model.to(device).train()  # set to training mode
     progress_bar = tqdm(range(num_training_steps))
     steps = 0  # steps taken so far
-    # TODO: can track training loss here?
+    best_val_acc = -float('inf')
+    best_model = model
     for epoch in range(num_epochs):
-        train_loss, pts_seen = 0, 0
+        train_loss, pts_seen, train_correct = 0, 0, 0
         for batch in train_dataloader:
             # includes input_ids, attention_mask, labels etc.
             batch_topass = {
                 'input_ids': batch['input_ids'].to(device),
                 'attention_mask': batch['attention_mask'].to(device),
                 'labels': batch['label'].to(device)
-            }  # things like dialect and text are not passed to the model
-            pts_seen += args.batch_size
-            outputs = model(**batch_topass)  # unpack dict and pass as kwargs
-            
-            # normally, i'd have to compute the loss with a custom loss_fn
-            # but in HF, it's part of model output for convenience
+            }
+            outputs = model(**batch_topass)
+            logits = outputs.logits
+            # count denominator of mean loss / accuracy as you go
+            pts_seen += batch_topass['input_ids'].shape[0]            
+                        
             loss = outputs.loss
-            train_loss += loss.item()
-            loss.backward()  # compute gradients (based on `labels` passed to model)            
+            # haven't found it in source, but am convinced loss.item() is average loss of batch and not the sum
+            train_loss += loss.item() * batch_topass['input_ids'].shape[0]
+            loss.backward()  # compute gradients (based on `labels` passed to model)
+            
+            # make predictions for tracking train accuracy
+            preds = torch.argmax(logits, axis=-1)
+            batch_acc = torch.sum(preds.cpu() == batch['label']).item()
+            train_correct += batch_acc
 
-            optimizer.step()  # gradient update based on current training rate
+            optimizer.step()  # gradient update based on current learning rate
             scheduler.step()
             optimizer.zero_grad()  # clear out gradients, compute new ones for next batch
-            # TODO: read about gradient accumulation steps -- maybe i should incorporate it
+            # note: possibility to use gradient accumulation steps if larger batches needed
             progress_bar.update(1)
             steps += 1
 
             # track training metrics if args ask for it
-            if args.tracking and steps % args.tracking_interval == 0:
-                progress_bar.set_description(f'Tracked metrics at step {steps}')
-                eval_preds, train_preds = evaluate_model(model, val_data, train_data)
-                metrics = compute_metrics(model, train_data, val_data)  # could also be re-used with a Trainer
+            if args.tracking == "steps" and steps % args.tracking_interval == 0:
+                progress_bar.set_description(f'Logged @ step {steps}')                
+                eval_loss, eval_acc = evaluate_model(model, val_dataloader)
+                train_loss /= pts_seen
+                train_correct /= pts_seen
+                metrics = {
+                    'training_loss': train_loss,
+                    'training_acc': train_correct,
+                    'eval_loss': eval_loss,
+                    'eval_acc': eval_acc
+                }
                 wandb.log(metrics)
+                pts_seen = 0; train_correct = 0; train_loss = 0
 
-    return model
+        # check if i have the best model at the end of every epoch
+        epoch_loss, epoch_acc = evaluate_model(model, val_dataloader)
+        if epoch_acc > best_val_acc:
+            best_model = model
+            best_val_acc = epoch_acc
+
+    return best_model
 
 def train_helper(
         args: argparse.Namespace,
@@ -159,18 +188,20 @@ def train_helper(
     # instantiate model and fine-tune based on training mode
     model = AutoModelForSequenceClassification.from_pretrained(args.model_path, num_labels=2)    
     if args.train_mode == 'custom':
-        train_custom_loop(model, args, train_data_tok, val_data_tok)
+        model_ft = train_custom_loop(model, args, train_data_tok, val_data_tok)
+        model_ft.save_pretrained(args.model_out_path)
     else:
         raise Exception(f'training mode `{args.train_mode}` not implemented')
     
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Fine-tune a model for given classification task')
+    parser = argparse.ArgumentParser(description='Fine-tune a model for given classification task.')
     parser.add_argument('--data-path', type=str, required=True)
     parser.add_argument('--train-mode', type=str, choices=['trainer', 'custom', 'private'], required=True,
                         help="`trainer` (use HF Trainer), `custom` (custom PyTorch training loop), or `private` (use private-transformers). If private, `privacy_args` also required")
     parser.add_argument('--model-path', type=str, default="FacebookAI/roberta-base", required=False)
+    parser.add_argument('--model-out-path', type=str, required=True)
     parser.add_argument('--seed', type=int, required=False, default=42)
     parser.add_argument('--tokenizer-maxlen', type=int, required=False, default=128)
     parser.add_argument('--epochs', type=int, required=False, default=3)
@@ -179,8 +210,8 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, required=False, default=1e-5)    
     parser.add_argument('--lr-scheduler', type=str, required=False, default="cosine")
     parser.add_argument('--warmup-ratio', type=float, required=False, default=0.1)
-    parser.add_argument('--tracking', type=bool, required=False, default=True)
-    parser.add_argument('--tracking-interval', type=int, required=False, default=1000)
+    parser.add_argument('--tracking', type=str, choices=['steps', 'epochs'], required=False, default='steps')
+    parser.add_argument('--tracking-interval', type=int, required=False, default=10000)
     args = parser.parse_args()
 
     dataset = datasets.load_from_disk(args.data_path)
