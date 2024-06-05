@@ -111,14 +111,15 @@ def train_custom_loop(
                 'attention_mask': batch['attention_mask'].to(device),
                 'labels': batch['label'].to(device)
             }
+            curr_batch_size = batch_topass['input_ids'].shape[0]
             outputs = model(**batch_topass)
             logits = outputs.logits
             # count denominator of mean loss / accuracy as you go
-            pts_seen += batch_topass['input_ids'].shape[0]            
+            pts_seen += curr_batch_size
                         
             loss = outputs.loss
             # haven't found it in source, but am convinced loss.item() is average loss of batch and not the sum
-            train_loss += loss.item() * batch_topass['input_ids'].shape[0]
+            train_loss += loss.item() * curr_batch_size 
             loss.backward()  # compute gradients (based on `labels` passed to model)
             
             # make predictions for tracking train accuracy
