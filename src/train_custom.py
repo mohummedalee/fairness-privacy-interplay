@@ -1,10 +1,8 @@
-import os, sys
-ROOT_DIR = "/work/fairness-privacy/"
-sys.path.append(ROOT_DIR)
-
 import pdb
 import argparse
 import warnings; warnings.simplefilter(action='ignore', category=FutureWarning)
+import os, sys
+sys.path.append("/work/fairness-privacy")  # root dir
 from typing import *
 
 import numpy as np
@@ -17,13 +15,9 @@ from torch.utils.data import DataLoader
 
 import datasets
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import RobertaTokenizer, RobertaForSequenceClassification
 from transformers import get_scheduler
-
-# private-transformers has sub-classed versions of HF Trainer and TrainingArguments
-private_transformers_path = ROOT_DIR + "private-transformers/"
-sys.path.append(private_transformers_path)
-from examples.classification.src.trainer import Trainer
-from examples.classification.src.compiled_args import PrivacyArguments, TrainingArguments
+from private_transformers import PrivacyEngine
 
 import wandb; WANDB_PROJECT="fairness-privacy"
 
@@ -80,13 +74,8 @@ def evaluate_model(
 #     return metric.compute(predictions=predictions, references=labels)
 
 
-def load_model_and_tokenizer(model_name):
-    model = AutoModelForSequenceClassification.from_pretrained(model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    return model, tokenizer
-
-
 def train_private(
+        model: AutoModelForSequenceClassification,
         args: argparse.Namespace,
         train_data: datasets.Dataset,
         val_data: datasets.Dataset
@@ -105,70 +94,41 @@ def train_private(
     """
     wandb.init(project=WANDB_PROJECT, job_type='train-custom', config=vars(args))
 
-    """
-    # from repository:
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        model_args=model_args,
-        privacy_args=privacy_args,
-        auxiliary_args=auxiliary_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        compute_metrics=build_compute_metrics_fn(data_args.task_name)
-    )
-    """
-    training_args = TrainingArguments(
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        # optimizer defaults to AdamW, scheduler to linear with warmup
+    num_epochs = args.epochs
+    train_dataloader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
+    val_dataloader = DataLoader(val_data, batch_size=args.batch_size, shuffle=True)
+    num_training_steps = num_epochs * len(train_dataloader)
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = get_scheduler(
+        name=args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=int(args.warmup_ratio * num_training_steps),
+        num_training_steps=num_training_steps
     )    
-
-    privacy_args = PrivacyArguments(
+    privacy_engine = PrivacyEngine(
+        model,
+        batch_size=args.batch_size,
+        sample_size=len(train_dataloader.dataset),
+        epochs=num_epochs,
+        max_grad_norm=args.priv_max_grad_norm,
         target_epsilon=args.priv_epsilon,
-        per_example_max_grad_norm=args.priv_max_grad_norm
-    )    
-
-    model, tokenizer = load_model_and_tokenizer(args.model_path)
-    trainer = Trainer(
-        model=model,
-        tokenizer=tokenizer,
-        args=training_args,
-        privacy_args=privacy_args,
-        train_dataset=train_data,
-        eval_dataset=val_data,
-        # TODO: resume here: learn how to write compute_metrics foe experiment tracking
-        compute_metrics=build_compute_metrics_fn(data_args.task_name)
     )
+    privacy_engine.attach(optimizer)
+    """
+    --- Understanding the PrivacyEngine parameters ---
+    From Opacus docs: https://opacus.ai/api/_modules/opacus/privacy_engine.html#PrivacyEngine.make_private
+    `noise_multiplier`: The ratio of the standard deviation of the Gaussian noise to
+        the L2-sensitivity of the function to which the noise is added
+        (How much noise to add)
+    `max_grad_norm`: The maximum norm of the per-sample gradients. Any gradient with norm
+        higher than this will be clipped to this value.    
     
-    named_params = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
-    no_decay = ['bias', 'LayerNorm.weight']
-    optimizer_grouped_parameters = [
-        {
-            'params': [p for n, p in named_params if not any(nd in n for nd in no_decay)],
-            'weight_decay': training_args.weight_decay
-        },
-        {'params': [p for n, p in named_params if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-    ]
-    optimizer = trainer.optimizer = torch.optim.AdamW(
-        optimizer_grouped_parameters,
-        lr=training_args.learning_rate,
-        betas=(training_args.adam_beta1, training_args.adam_beta2),
-        eps=training_args.adam_epsilon,
-    )
-    if training_args.lr_decay:  # Default linear decay.
-        training_setup = trainer.get_training_setup()
-        t_total = training_setup["t_total"]
-        # `trainer.optimizer` is not None here, so no optimizer is created.
-        trainer.create_optimizer_and_scheduler(num_training_steps=t_total)
-    else:
-        trainer.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(trainer.optimizer, lambda _: 1.)
-
-    trainer.train(model_path=None)
-    if training_args.save_at_last:
-        trainer.save_model(training_args.output_dir)
+    >> parameters that we want to understand better: `sample_size` <<
+        - `sample_size` and its relation to `batch_size`
+        I currently believe sample_size is L and batch_size is N in the DP-SGD algorithm
+    """
 
     model.to(device).train()  # set to training mode
     progress_bar = tqdm(range(num_training_steps))
