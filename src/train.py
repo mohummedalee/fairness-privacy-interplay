@@ -1,4 +1,4 @@
-import os, sys
+import os, sys, json
 ROOT_DIR = "/work/fairness-privacy/"
 sys.path.append(ROOT_DIR)
 
@@ -67,7 +67,8 @@ def train_private(
     fine-tuned model that can be saved
     """
     wandb.init(project=WANDB_PROJECT, job_type='train-custom', config=vars(args))
-    
+            
+    # set up training and privacy arguments    
     gradient_accumulation_steps = args.batch_size // args.per_device_train_batch_size
     training_args = TrainingArguments(
         num_train_epochs=args.epochs,
@@ -79,29 +80,21 @@ def train_private(
         evaluation_strategy=args.tracking,
         eval_steps=args.tracking_interval,
         report_to="wandb",
+        # _n_gpu=torch.cuda.device_count(),
         logging_steps=args.tracking_interval,
-        output_dir=args.model_out_path,
-        n_gpu=torch.cuda.device_count()
-    )    
-
+        output_dir=args.model_out_path        
+    )
+    print('GPUS:', training_args.n_gpu)
     privacy_args = PrivacyArguments(
         target_epsilon=args.priv_epsilon,
-        per_example_max_grad_norm=args.priv_max_grad_norm
-        # TODO: accounting_mode, clipping_mode, target_delta
+        per_example_max_grad_norm=args.priv_max_grad_norm,
+        non_private="no"
+        # use default `accounting_mode`, `clipping_mode`, target_delta
     )    
-
-    acc_metric = evaluate.load_metric("accuracy")
+    # load model and tokenizer
     model, tokenizer = load_model_and_tokenizer(args.model_path)
-    trainer = Trainer(
-        model=model,
-        tokenizer=tokenizer,
-        args=training_args,
-        privacy_args=privacy_args,
-        train_dataset=train_data,
-        eval_dataset=val_data,        
-        compute_metrics=functools.partial(compute_metrics_fn, acc_metric),
-    )
-    
+
+    # set up optimizer with recipe from lxuechen    
     named_params = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
@@ -116,23 +109,35 @@ def train_private(
             'weight_decay': 0.0
         }
     ]
-    optimizer = trainer.optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.AdamW(
         optimizer_grouped_parameters,
         lr=training_args.learning_rate
-    )
+    )    
+
+    # set up trainer, lr scheduler, evaluation metrics etc.
+    acc_metric = evaluate.load("accuracy")    
     num_training_steps = training_args.num_train_epochs * len(train_data)
-    scheduler = get_scheduler(
+    lr_scheduler = get_scheduler(
         name=args.lr_scheduler,
         optimizer=optimizer,
         num_warmup_steps=int(args.warmup_ratio * num_training_steps),
         num_training_steps=num_training_steps
-    )        
-    # TODO: attach optimizer to privacy engine etc.
+    )
+    trainer = Trainer(
+        model=model,
+        tokenizer=tokenizer,
+        args=training_args,
+        optimizers=(optimizer, lr_scheduler),
+        privacy_args=privacy_args,
+        train_dataset=train_data,
+        eval_dataset=val_data,
+        # compute_metrics can be extended by passing more metrics
+        compute_metrics=functools.partial(compute_metrics_fn, acc_metric),
+    )
     
-    total_train_batch_size = training_args.gradient_accumulation_steps * training_args.per_device_train_batch_size
     privacy_engine = PrivacyEngine(
         module=model,
-        batch_size=total_train_batch_size,
+        batch_size=args.batch_size,  # the full batch size, not per device
         sample_size=len(train_data),
         epochs=training_args.num_train_epochs,
         max_grad_norm=privacy_args.per_example_max_grad_norm,
@@ -141,11 +146,11 @@ def train_private(
         target_delta=privacy_args.target_delta,
         accounting_mode=privacy_args.accounting_mode,
         clipping_mode=privacy_args.clipping_mode,
-        skip_checks=True,
+        skip_checks=True        
     )
     # Originally, it could have been null.
     privacy_args.noise_multiplier = privacy_engine.noise_multiplier
-    privacy_args.target_delta = privacy_engine.target_delta
+    privacy_args.target_delta = privacy_engine.target_delta    
 
     print('privacy_args: ')
     print(json.dumps(privacy_args.__dict__, indent=4))
@@ -282,13 +287,16 @@ def train_helper(
     ).with_format("torch")
     
     # instantiate model and fine-tune based on training mode
-    model = AutoModelForSequenceClassification.from_pretrained(args.model_path, num_labels=2)    
+    model = AutoModelForSequenceClassification.from_pretrained(args.model_path, num_labels=2)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     if args.train_mode == 'custom':
-        model_ft = train_custom_loop(model, args, train_data_tok, val_data_tok)
-        model_ft.save_pretrained(args.model_out_path)
+        # model_ft = train_custom_loop(model, args, train_data_tok, val_data_tok)
+        # model_ft.save_pretrained(args.model_out_path)
+        raise NotImplementedError("Custom training needs to be re-implemented with Trainer.")
     elif args.train_mode == 'private':
-        assert args.priv_epsilon is not None and args.priv_max_grad_norm is not None, "`priv_max_grad_norm` and `priv_epsilon` required for private training"
-        model_ft = train_private(model, args, train_data_tok, val_data_tok)
+        assert (args.priv_epsilon is not None and args.priv_max_grad_norm is not None), \
+              "--priv-max-grad-norm and --priv-epsilon required for private training"
+        model_ft = train_private(args, train_data_tok, val_data_tok)
         model_ft.save_pretrained(args.model_out_path)        
     else:
         raise Exception(f'training mode `{args.train_mode}` not implemented')
@@ -314,10 +322,11 @@ if __name__ == '__main__':
     parser.add_argument('--tracking', type=str, choices=['steps', 'epoch'], required=False, default='steps')
     parser.add_argument('--tracking-interval', type=int, required=False, default=10000)    
 
-    # privacy arguments
+    # --- PRIVACY ARGUMENTS ---
     parser.add_argument('--priv-epsilon', type=float, required=False)
     parser.add_argument('--priv-max-grad-norm', type=float, required=False)
-    # TODO: accounting_mode, clipping_mode, target_delta
+    parser.add_argument('--priv-clipping-mode', choices=['default', 'ghost'], default='default', required=False)
+    # using default accounting_mode and target_delta
     args = parser.parse_args()
 
     dataset = datasets.load_from_disk(args.data_path)
