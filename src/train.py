@@ -1,8 +1,7 @@
-import os, sys, json
+import os, sys, json, pdb
 ROOT_DIR = "/work/fairness-privacy/"
 sys.path.append(ROOT_DIR)
 
-import pdb
 import argparse
 import warnings; warnings.simplefilter(action='ignore', category=FutureWarning)
 from typing import *
@@ -66,7 +65,7 @@ def train_private(
     Returns:
     fine-tuned model that can be saved
     """
-    wandb.init(project=WANDB_PROJECT, job_type='train-custom', config=vars(args))
+    wandb.init(project=WANDB_PROJECT, job_type='train-private', config=vars(args))
             
     # set up training and privacy arguments    
     gradient_accumulation_steps = args.batch_size // args.per_device_train_batch_size
@@ -78,11 +77,11 @@ def train_private(
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
         evaluation_strategy=args.tracking,
+        do_eval=args.do_eval,
         eval_steps=args.tracking_interval,
         report_to="wandb",
-        # _n_gpu=torch.cuda.device_count(),
         logging_steps=args.tracking_interval,
-        output_dir=args.model_out_path        
+        output_dir=args.model_out_path
     )
     print('GPUS:', training_args.n_gpu)
     privacy_args = PrivacyArguments(
@@ -133,7 +132,8 @@ def train_private(
         eval_dataset=val_data,
         # compute_metrics can be extended by passing more metrics
         compute_metrics=functools.partial(compute_metrics_fn, acc_metric),
-    )
+        tracker_obj=wandb,
+    )    
     
     privacy_engine = PrivacyEngine(
         module=model,
@@ -156,13 +156,12 @@ def train_private(
     print(json.dumps(privacy_args.__dict__, indent=4))
     privacy_engine.attach(optimizer)
     # AND TRAIN...
-    trainer.train(model_path=None)
+    trainer.train(model_path=None, dev_objective="eval_accuracy")
 
     return trainer.model
 
 
-def train_custom_loop(
-        model: AutoModelForSequenceClassification,
+def train_nonprivate(        
         args: argparse.Namespace,
         train_data: datasets.Dataset,
         val_data: datasets.Dataset
@@ -180,8 +179,9 @@ def train_custom_loop(
     fine-tuned model that can be saved
     """
     # set up experiment tracking
-    wandb.init(project=WANDB_PROJECT, job_type='train-custom', config=vars(args))
-
+    wandb.init(project=WANDB_PROJECT, job_type='train-nonprivate', config=vars(args))
+    
+    model, tokenizer = load_model_and_tokenizer(args.model_path)
     num_epochs = args.epochs
     train_dataloader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
     val_dataloader = DataLoader(val_data, batch_size=args.batch_size, shuffle=True)
@@ -320,6 +320,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr-scheduler', type=str, required=False, default="cosine")
     parser.add_argument('--warmup-ratio', type=float, required=False, default=0.1)
     parser.add_argument('--tracking', type=str, choices=['steps', 'epoch'], required=False, default='steps')
+    parser.add_argument('--do-eval', default=False, action='store_true')
     parser.add_argument('--tracking-interval', type=int, required=False, default=10000)    
 
     # --- PRIVACY ARGUMENTS ---
