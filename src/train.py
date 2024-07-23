@@ -1,6 +1,7 @@
 import os, sys, json, pdb
 ROOT_DIR = "/work/fairness-privacy/"
 sys.path.append(ROOT_DIR)
+os.environ["WANDB_DISABLED"] = "true"
 
 import argparse
 import warnings; warnings.simplefilter(action='ignore', category=FutureWarning)
